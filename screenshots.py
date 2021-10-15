@@ -12,13 +12,15 @@ import sys
 PLAYLIST_FILE = "playlist.txt"
 CLIPS_FILE = "clips.gif"
 LABEL_FILE = "label.png"
+FONT_FILE = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+FONT_SIZE = 16
+FONT_COLOR = "white"
+FONT_BACKGROUND = "black"
 MIN_DEPTH = 96
 MAX_DEPTH = 256
 MIN_FRAME_RATE = 12
 MAX_FRAME_RATE = 50
-
 MIN_TIME_DELTA = 10
-MAX_TIME_DELTA = 60
 
 class VideoMetadata(object):
 	def __init__(self, filename):
@@ -62,7 +64,7 @@ def parse_cli():
 	parser.add_argument("--frames",      "-f", type=int,   default= 20,    metavar="N",    help="Number of full size frames")
 	parser.add_argument("--clips",       "-C", type=int,   default=  5,    metavar="N",    help="Number of clips")
 	parser.add_argument("--clip-width",  "-W", type=int,   default=250,    metavar="PX",   help="Width of clips")
-	parser.add_argument("--clip-length", "-L", type=float, default=  3,    metavar="SEC",  help="Length of each clips")
+	parser.add_argument("--clip-length", "-L", type=float, default=  3,    metavar="SEC",  help="Length of each clip")
 	parser.add_argument("--clip-size",   "-S", type=str,   default= "5MB", metavar="SIZE", help="Maximum total size of all clips")
 	parser.add_argument("--cut-start",   "-x", type=float, default=  0,    metavar="SEC",  help="Skip the first part of the source video")
 	parser.add_argument("--cut-end",     "-y", type=float, default=  0,    metavar="SEC",  help="Skip the last part of the source video")
@@ -158,7 +160,6 @@ def process_video(video, args):
 		cells = args.columns * rows
 		dt_cell = video.length / (cells + 1)
 		timestamps = [ (i + 1) * dt_cell for i in range(cells) ]
-		font = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 		ffmpeg_mimo(
 			[ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ],
 			[
@@ -166,7 +167,7 @@ def process_video(video, args):
 					"-filter:v", ",".join([
 						f"scale={args.width}:-1",
 						f"setpts=({i}+1)/TB*{dt_cell}",
-						f"drawtext=text=%{{pts\\\:hms}}:fontfile={font}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor=white:shadowcolor=black",
+						f"drawtext=text=%{{pts\\\:hms}}:fontfile={FONT_FILE}:fontsize={FONT_SIZE}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor={FONT_COLOR}:shadowcolor={FONT_BACKGROUND}",
 					]),
 					"-frames:v", "1",
 					f"{args.prefix}montage{i:0{digits(cells)}d}.png"
@@ -195,7 +196,7 @@ def choose_dither_algo(depth, frame_rate, multi_palette, prefix):
 		prefix + "sierra2.gif":			"dither=sierra2",
 		prefix + "sierra2_4a.gif":		"dither=sierra2_4a"
 	}
-	cmd = [ "-f", "concat", "-i", prefix + PLAYLIST_FILE ]
+	cmd = [ "-f", "concat", "-safe", "0", "-i", prefix + PLAYLIST_FILE ]
 	for name, algo in dither_algos.items():
 		cmd += [ "-filter:v", filter_v(depth, frame_rate, algo, multi_palette), name ]
 	ffmpeg(*cmd)
@@ -242,17 +243,20 @@ def ffmpeg_mimo(inputs, outputs, limit=10):
 		b = a + limit
 		ffmpeg(
 			"-vsync", "passthrough",
-			*sum(inputs[a:b], start=[]),
-			*sum([ [ "-map", f"{j}:v" ] + out for j, out in zip(range(limit), outputs[a:b]) ], start=[])
+			*flatten(inputs[a:b]),
+			*flatten([ [ "-map", f"{j}:v" ] + out for j, out in zip(range(limit), outputs[a:b]) ])
 		)
 	if M != 0:
 		a = N * limit
 		b = a + M
 		ffmpeg(
 			"-vsync", "passthrough",
-			*sum(inputs[a:b], start=[]),
-			*sum([ [ "-map", f"{j}:v" ] + out for j, out in zip(range(limit), outputs[a:b]) ], start=[])
+			*flatten(inputs[a:b]),
+			*flatten([ [ "-map", f"{j}:v" ] + out for j, out in zip(range(M), outputs[a:b]) ])
 		)
+
+def flatten(list_of_lists):
+	return [val for sublist in list_of_lists for val in sublist]
 
 def ffmpeg(*args):
 	print("ffmpeg", " ".join([ shlex.quote(arg) for arg in args ]))
@@ -282,10 +286,10 @@ def montage(outfile, columns, rows, infiles):
 def create_label(filename, text, width):
 	proc = run([
 		"convert",
-		"-background", "black",
-		"-fill", "white",
-		"-font", "DejaVu-Sans-Mono",
-		"-pointsize", "16",
+		"-background", FONT_BACKGROUND,
+		"-fill", FONT_COLOR,
+		"-font", FONT_FILE,
+		"-pointsize", str(FONT_SIZE),
 		"-size", str(width) + "x",
 		"caption:" + text,
 		filename
