@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -O
 # vim: noexpandtab, tabstop=4, number
-from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, Namespace
+from configparser import ConfigParser
 from glob import glob
 import json
 from math import ceil, floor, log, sqrt
@@ -8,19 +9,6 @@ import os
 import shlex
 from subprocess import run, DEVNULL, PIPE, CalledProcessError
 import sys
-
-PLAYLIST_FILE = "playlist.txt"
-CLIPS_FILE = "clips.gif"
-LABEL_FILE = "label.png"
-FONT_FILE = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-FONT_SIZE = 16
-FONT_COLOR = "white"
-FONT_BACKGROUND = "black"
-MIN_DEPTH = 96
-MAX_DEPTH = 256
-MIN_FRAME_RATE = 12
-MAX_FRAME_RATE = 50
-MIN_TIME_DELTA = 10
 
 class VideoMetadata(object):
 	def __init__(self, filename):
@@ -53,26 +41,134 @@ class VideoMetadata(object):
 	@property
 	def frame_rate_den(self): return int(self.frame_rate_str.split("/")[1])
 
+	@property
+	def dt_frame(self): return self.frame_rate_den / self.frame_rate_num
+
+PLAYLIST_FILE = "playlist.txt"
+CLIPS_FILE = "clips.gif"
+LABEL_FILE = "label.png"
+DEFAULT_ARGS = Namespace(
+	frames = 20,
+	file_size_max = "5MB",
+	font_file = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+	font_size = 16,
+	font_color = "white",
+	font_background = "black",
+	gif_color_depth_min = 96,
+	gif_color_depth_max = 256,
+	gif_frame_rate_min = 12,
+	gif_frame_rate_max = 50,
+	gif_clips = 5,
+	gif_length = 3,
+	gif_width = 250,
+	webp_clips = 6,
+	webp_length = 5,
+	webp_width = 250,
+	montage_columns = 5,
+	montage_rows = 10,
+	montage_cell_width = 320,
+	montage_time_delta_min = 10
+)
+
+def parse_config(filename):
+	configfile = ConfigParser()
+	configfile.read(filename)
+	args = Namespace()
+	config_option(configfile, "main", "frames", args, "frames", int)
+	config_option(configfile, "main", "file.size.max", args, "file_size_max")
+	config_option(configfile, "gif", "color.depth.min", args, "gif_color_depth_min", int)
+	config_option(configfile, "gif", "color.depth.max", args, "gif_color_depth_max", int)
+	config_option(configfile, "gif", "frame.rate.min", args, "gif_frame_rate_min", float)
+	config_option(configfile, "gif", "frame.rate.max", args, "gif_frame_rate_max", float)
+	config_option(configfile, "gif", "clips", args, "gif_clips", int)
+	config_option(configfile, "gif", "length", args, "gif_length", float)
+	config_option(configfile, "gif", "width", args, "gif_width", int)
+	config_option(configfile, "webp", "clips", args, "webp_clips", int)
+	config_option(configfile, "webp", "length", args, "webp_length", float)
+	config_option(configfile, "webp", "width", args, "webp_width", int)
+	config_option(configfile, "montage", "columns", args, "montage_columns", int)
+	config_option(configfile, "montage", "rows", args, "montage_rows", int)
+	config_option(configfile, "montage", "cell.width", args, "montage_cell_width", int)
+	config_option(configfile, "montage", "time.delta.min", args, "montage_time_delta_min", float)
+	config_option(configfile, "font", "file", args, "font_file")
+	config_option(configfile, "font", "size", args, "font_size", int)
+	config_option(configfile, "font", "color", args, "font_color")
+	config_option(configfile, "font", "background", args, "font_background")
+	return args
+
+def config_option(configfile, section, option, namespace, name, f=str):
+	default_value = getattr(DEFAULT_ARGS, name)
+	setattr(namespace, name, f(configfile.get(section, option, fallback=default_value)))
+
 def parse_cli():
+	config = parse_config(os.path.join(os.environ["HOME"], ".torrentutils", "screenshots.conf"))
 	parser = ArgumentParser(
 		description="Take screenshots and short clips from a video",
 		formatter_class=ArgumentDefaultsHelpFormatter
 	)
-	parser.add_argument("--columns",     "-c", type=int,   default=  5,    metavar="COLS", help="Number of columns in montage")
-	parser.add_argument("--rows",        "-r", type=int,   default= 10,    metavar="ROWS", help="Number of rows in montage")
-	parser.add_argument("--width",       "-w", type=int,   default=320,    metavar="PX",   help="Width of a single screenshot in montage")
-	parser.add_argument("--frames",      "-f", type=int,   default= 20,    metavar="N",    help="Number of full size frames")
-	parser.add_argument("--clips",       "-C", type=int,   default=  5,    metavar="N",    help="Number of clips")
-	parser.add_argument("--clip-width",  "-W", type=int,   default=250,    metavar="PX",   help="Width of clips")
-	parser.add_argument("--clip-length", "-L", type=float, default=  3,    metavar="SEC",  help="Length of each clip")
-	parser.add_argument("--clip-size",   "-S", type=str,   default= "5MB", metavar="SIZE", help="Maximum total size of all clips")
-	parser.add_argument("--cut-start",   "-x", type=float, default=  0,    metavar="SEC",  help="Skip the first part of the source video")
-	parser.add_argument("--cut-end",     "-y", type=float, default=  0,    metavar="SEC",  help="Skip the last part of the source video")
-	parser.add_argument("--keep",        "-k", action="store_true",                        help="Keep and reuse temporary files")
-	parser.add_argument("--prefix",      "-p", type=str,   default="",     metavar="NAME", help="File name prefix")
+
 	parser.add_argument("files", nargs="+")
+
+	group = parser.add_argument_group("common arguments")
+	group.add_argument("--prefix", "-p", required=True,
+		metavar="NAME", help="File name prefix")
+	group.add_argument("--cut-start", "-x", type=float, default=0,
+		metavar="SEC", help="Skip the first part of the source video")
+	group.add_argument("--cut-end", "-y", type=float, default=0,
+		metavar="SEC",  help="Skip the last part of the source video")
+	group.add_argument("--keep", "-k", action="store_true",
+		help="Keep and reuse temporary files")
+	group.add_argument("--frames","-f", type=int, default=config.frames,
+		metavar="N", help="Number of full size frames")
+	group.add_argument("--file-size-max", type=str, default=config.file_size_max,
+		metavar="SIZE", help="Maximum total size of all clips")
+
+	group = parser.add_argument_group("GIF arguments")
+	group.add_argument("--gif-clips", type=int, default=config.gif_clips,
+		metavar="N", help="Number of clips")
+	group.add_argument("--gif-length", type=float, default=config.gif_length,
+		metavar="SEC",  help="Length of each clip")
+	group.add_argument("--gif-width", type=int, default=config.gif_width,
+		metavar="PX",   help="Width of clips")
+	group.add_argument("--gif-color-depth-min", type=int, default=config.gif_color_depth_min,
+		metavar="N", help="Minimum color depth to try before switching to single palette mode")
+	group.add_argument("--gif-color-depth-max", type=int, default=config.gif_color_depth_max,
+		metavar="N", help="Maximum color depth to try")
+	group.add_argument("--gif-frame-rate-min", type=float, default=config.gif_frame_rate_min,
+		metavar="FPS", help="Minimum frame rate to try before switching to single palette mode")
+	group.add_argument("--gif-frame-rate-max", type=float, default=config.gif_frame_rate_max,
+		metavar="FPS", help="Maximum frame rate to try")
+
+	group = parser.add_argument_group("WEBP arguments")
+	group.add_argument("--webp-clips", type=int, default=config.webp_clips,
+		metavar="N", help="Number of clips")
+	group.add_argument("--webp-length", type=float, default=config.webp_length,
+		metavar="SEC",  help="Length of each clip")
+	group.add_argument("--webp-width", type=int, default=config.webp_width,
+		metavar="PX",   help="Width of clips")
+
+	group = parser.add_argument_group("montage arguments")
+	group.add_argument("--montage-columns", type=int, default=config.montage_columns,
+		metavar="COLS", help="Number of columns in montage")
+	group.add_argument("--montage-rows", type=int, default=config.montage_rows,
+		metavar="ROWS", help="Number of rows in montage")
+	group.add_argument("--montage-cell-width", type=int, default=config.montage_cell_width,
+		metavar="PX",   help="Width of a single screenshot in montage")
+	group.add_argument("--montage-time-delta-min", type=float, default=config.montage_time_delta_min,
+		metavar="SEC", help="Minimum time between cells")
+
+	group = parser.add_argument_group("font arguments")
+	group.add_argument("--font-file", default=config.font_file,
+		metavar="FILE", help="TTF font file")
+	group.add_argument("--font-size", type=int, default=config.font_size,
+		metavar="SIZE", help="Font size")
+	group.add_argument("--font-color", default=config.font_color,
+		metavar="COLOR", help="Font color")
+	group.add_argument("--font-background", default=config.font_background,
+		metavar="COLOR", help="Background color")
+	
 	args = parser.parse_args()
-	args.clip_size = parse_size(args.clip_size)
+	args.file_size_max = parse_size(args.file_size_max)
 	return args
 
 def parse_size(s):
@@ -102,89 +198,59 @@ def main(args):
 	return returncode
 
 def process_video(video, args):
-	dt_frame = video.frame_rate_den / video.frame_rate_num
-	length_with_cuts = video.length - args.cut_start - args.cut_end
-	if args.clips > 0:
-		clip_files = []
-		ffinputs = []
-		ffoutputs = []
-		with open(args.prefix + PLAYLIST_FILE, "w") as playlist:
-			for i in range(args.clips):
-				clip_file = f"{args.prefix}clip{i + 1:0{digits(args.clips)}d}.mkv"
-				clip_files.append(clip_file)
-				if not (args.keep and os.path.exists(clip_file)):
-					ss = args.cut_start + length_with_cuts * (i + 1) / (args.clips + 1) - args.clip_length / 2
-					frames = round(args.clip_length * video.frame_rate_num / video.frame_rate_den)
-					ffinputs.append([ "-ss", str(ss), "-i", video.filename ])
-					ffoutputs.append([
-						"-frames:v", str(frames),
-						"-pix_fmt", "yuv444p",
-						"-filter:v", f"scale={args.clip_width}:-1,setsar=1",
-						"-codec:v", "libx265",
-						"-preset:v", "ultrafast",
-						"-x265-params", "lossless=1",
-						"-an", "-sn", "-dn",
-						clip_file
-					])
-				playlist.write("file '{}'\n".format(clip_file))
-		ffmpeg_mimo(ffinputs, ffoutputs)
-		depth = MAX_DEPTH
-		frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
-		multi_palette = True
-		s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
-		while s > args.clip_size:
-			r = args.clip_size / s
-			depth, frame_rate = next_guess(depth, frame_rate, multi_palette, r)
-			if multi_palette and (depth < MIN_DEPTH or frame_rate < MIN_FRAME_RATE):
-				depth = MAX_DEPTH
-				frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
-				multi_palette = False
-			s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
-		if not args.keep:
-			for f in clip_files:
-				os.unlink(f)
-			os.unlink(args.prefix + PLAYLIST_FILE)
+	if args.gif_clips > 0:
+		create_gif(video, args)
+	if args.webp_clips > 0:
+		create_webp(video, args)
 	if args.frames > 0:
-		dt_large = length_with_cuts / (args.frames + 1)
-		timestamps = [ args.cut_start + (i + 1) * dt_large for i in range(args.frames) ]
-		ffmpeg_mimo(
-			[ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ],
-			[ [ "-frames:v", "1", f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png" ] for i in range(args.frames) ]
-		)
-		for i in range(args.frames):
-			filename = f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png"
-			if os.stat(filename).st_size > args.clip_size:
-				os.unlink(filename)
-	if args.columns > 0 and args.rows > 0:
-		rows = min(max(floor(video.length / (MIN_TIME_DELTA * args.columns)), 1), args.rows)
-		cells = args.columns * rows
-		dt_cell = video.length / (cells + 1)
-		timestamps = [ (i + 1) * dt_cell for i in range(cells) ]
-		ffmpeg_mimo(
-			[ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ],
-			[
-				[
-					"-filter:v", ",".join([
-						f"scale={args.width}:-1",
-						f"setpts=({i}+1)/TB*{dt_cell}",
-						f"drawtext=text=%{{pts\\\:hms}}:fontfile={FONT_FILE}:fontsize={FONT_SIZE}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor={FONT_COLOR}:shadowcolor={FONT_BACKGROUND}",
-					]),
-					"-frames:v", "1",
-					f"{args.prefix}montage{i:0{digits(cells)}d}.png"
-				]
-				for i in range(cells)
-			]
-		)
-		montage(f"{args.prefix}montage.png", args.columns, rows, [ f"{args.prefix}montage{i:0{digits(cells)}d}.png" for i in range(cells) ])
-		create_label(args.prefix + LABEL_FILE, video.text, args.columns * args.width)
-		append_label(f"{args.prefix}montage.jpg", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
-		for i in range(cells):
-			os.unlink(f"{args.prefix}montage{i:0{digits(cells)}d}.png")
-		os.unlink(f"{args.prefix}montage.png")
-		os.unlink(args.prefix + LABEL_FILE)
+		create_frames(video, args)
+	if args.montage_columns > 0 and args.montage_rows > 0:
+		create_montage(video, args)
 
 def digits(n):
 	return ceil(log(n + 1, 10))
+
+def create_gif(video, args):
+	length_with_cuts = video.length - args.cut_start - args.cut_end
+	clip_files = []
+	ffinputs = []
+	ffoutputs = []
+	with open(args.prefix + PLAYLIST_FILE, "w") as playlist:
+		for i in range(args.gif_clips):
+			clip_file = f"{args.prefix}clip{i + 1:0{digits(args.gif_clips)}d}.mkv"
+			clip_files.append(clip_file)
+			if not (args.keep and os.path.exists(clip_file)):
+				ss = args.cut_start + length_with_cuts * (i + 1) / (args.gif_clips + 1) - args.gif_length / 2
+				frames = round(args.gif_length * video.frame_rate_num / video.frame_rate_den)
+				ffinputs.append([ "-ss", str(ss), "-i", video.filename ])
+				ffoutputs.append([
+					"-frames:v", str(frames),
+					"-pix_fmt", "yuv444p",
+					"-filter:v", f"scale={args.gif_width}:-1,setsar=1",
+					"-codec:v", "libx265",
+					"-preset:v", "ultrafast",
+					"-x265-params", "lossless=1",
+					"-an", "-sn", "-dn",
+					clip_file
+				])
+			playlist.write("file '{}'\n".format(clip_file))
+	ffmpeg_mimo(ffinputs, ffoutputs)
+	depth = args.gif_color_depth_max
+	frame_rate = min(video.frame_rate_num / video.frame_rate_den, args.gif_frame_rate_max)
+	multi_palette = True
+	s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
+	while s > args.file_size_max:
+		r = args.file_size_max / s
+		depth, frame_rate = next_guess(depth, frame_rate, multi_palette, r)
+		if multi_palette and (depth < args.gif_color_depth_min or frame_rate < args.gif_frame_rate_min):
+			depth = args.gif_color_depth_max
+			frame_rate = min(video.frame_rate_num / video.frame_rate_den, args.gif_frame_rate_max)
+			multi_palette = False
+		s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
+	if not args.keep:
+		for f in clip_files:
+			os.unlink(f)
+		os.unlink(args.prefix + PLAYLIST_FILE)
 
 def choose_dither_algo(depth, frame_rate, multi_palette, prefix):
 	dither_algos = {
@@ -233,6 +299,77 @@ def next_guess(depth, frame_rate, multi_palette, r):
 		# lower the framerate, the less of each frame is transparent. Hard to model, take the error into account??
 		return (depth, frame_rate * r)
 
+# TODO: WEBP support
+def create_webp(video, args):
+	pass
+
+def create_frames(video, args):
+	length_with_cuts = video.length - args.cut_start - args.cut_end
+	dt_large = length_with_cuts / (args.frames + 1)
+	timestamps = [ args.cut_start + (i + 1) * dt_large for i in range(args.frames) ]
+	ffmpeg_mimo(
+		[ [ "-ss", str(t), "-to", str(t + video.dt_frame), "-i", video.filename ] for t in timestamps ],
+		[ [ "-frames:v", "1", f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png" ] for i in range(args.frames) ]
+	)
+	for i in range(args.frames):
+		filename = f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png"
+		if os.stat(filename).st_size > args.file_size_max:
+			os.unlink(filename)
+
+def create_montage(video, args):
+	rows = min(max(floor(video.length / (args.montage_time_delta_min * args.montage_columns)), 1), args.montage_rows)
+	cells = args.montage_columns * rows
+	dt_cell = video.length / (cells + 1)
+	timestamps = [ (i + 1) * dt_cell for i in range(cells) ]
+	ffmpeg_mimo(
+		[ [ "-ss", str(t), "-to", str(t + video.dt_frame), "-i", video.filename ] for t in timestamps ],
+		[
+			[
+				"-filter:v", ",".join([
+					f"scale={args.montage_cell_width}:-1",
+					f"setpts=({i}+1)/TB*{dt_cell}",
+					f"drawtext=text=%{{pts\\\:hms}}:fontfile={args.font_file}:fontsize={args.font_size}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor={args.font_color}:shadowcolor={args.font_background}",
+				]),
+				"-frames:v", "1",
+				f"{args.prefix}montage{i:0{digits(cells)}d}.png"
+			]
+			for i in range(cells)
+		]
+	)
+	montage(f"{args.prefix}montage.png", args.montage_columns, rows, [ f"{args.prefix}montage{i:0{digits(cells)}d}.png" for i in range(cells) ])
+	create_label(video, args)
+	append_label(f"{args.prefix}montage.jpg", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
+	for i in range(cells):
+		os.unlink(f"{args.prefix}montage{i:0{digits(cells)}d}.png")
+	os.unlink(f"{args.prefix}montage.png")
+	os.unlink(args.prefix + LABEL_FILE)
+
+def montage(outfile, columns, rows, infiles):
+	proc = run([ "montage", "-geometry", "+0+0", "-tile", f"{columns}x{rows}" ] + infiles + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
+
+def create_label(video, args):
+	proc = run([
+		"convert",
+		"-background", args.font_background,
+		"-fill", args.font_color,
+		"-font", args.font_file,
+		"-pointsize", str(args.font_size),
+		"-size", str(args.montage_columns * args.montage_cell_width) + "x",
+		"caption:" + video.text,
+		args.prefix + LABEL_FILE
+	], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
+
+def append_label(outfile, *args):
+	proc = run([
+		"convert",
+		"-quality", "95",
+		"-background", "black",
+		"-append"
+	] + list(args) + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
+
 def ffmpeg_mimo(inputs, outputs, limit=10):
 	assert len(inputs) == len(outputs)
 	# Process `limit` inputs at a time to limit memory usage
@@ -278,32 +415,6 @@ def ffprobe_text(filename):
 	)
 	proc.check_returncode()
 	return proc.stderr.decode(sys.getdefaultencoding()).strip()
-
-def montage(outfile, columns, rows, infiles):
-	proc = run([ "montage", "-geometry", "+0+0", "-tile", f"{columns}x{rows}" ] + infiles + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
-	proc.check_returncode()
-
-def create_label(filename, text, width):
-	proc = run([
-		"convert",
-		"-background", FONT_BACKGROUND,
-		"-fill", FONT_COLOR,
-		"-font", FONT_FILE,
-		"-pointsize", str(FONT_SIZE),
-		"-size", str(width) + "x",
-		"caption:" + text,
-		filename
-	], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
-	proc.check_returncode()
-
-def append_label(outfile, *args):
-	proc = run([
-		"convert",
-		"-quality", "95",
-		"-background", "black",
-		"-append"
-	] + list(args) + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
-	proc.check_returncode()
 
 if __name__ == "__main__":
 	sys.exit(main(parse_cli()))
