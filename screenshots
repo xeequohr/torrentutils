@@ -100,6 +100,7 @@ def main(args):
 	return returncode
 
 def process_video(video, args):
+	dt_frame = video.frame_rate_den / video.frame_rate_num
 	length_with_cuts = video.length - args.cut_start - args.cut_end
 	make_large = args.frames > 0
 	make_small = args.columns > 0 and args.rows > 0
@@ -128,9 +129,17 @@ def process_video(video, args):
 					run_ffmpeg = True
 				playlist.write("file '{}'\n".format(clip_file))
 	if make_large:
-		frame_rate = args.frames / length_with_cuts
-		cmd += [ "-ss", str(args.cut_start), "-filter:v", "fps=" + str(frame_rate), "-frames:v", str(args.frames), filename_pattern(args.prefix + "frame{}.png", args.frames) ]
-		run_ffmpeg = True
+		dt_large = length_with_cuts / (args.frames + 1)
+		timestamps = [ args.cut_start + (i + 1) * dt_large for i in range(args.frames) ]
+		ffmpeg(
+			"-vsync", "passthrough",
+			*sum([ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ], start=[]),
+			*sum([ [ "-map", f"{i}:v", "-frames:v", "1", f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png" ] for i in range(args.frames) ], start=[])
+		)
+		for i in range(args.frames):
+			filename = f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png"
+			if os.stat(filename).st_size > args.clip_size:
+				os.unlink(filename)
 	if make_small:
 		rows = min(max(floor(video.length / (MIN_TIME_DELTA * args.columns)), 1), args.rows)
 		cells = args.columns * rows
@@ -144,7 +153,6 @@ def process_video(video, args):
 			f"drawtext=text=%{{pts\\\:hms}}:fontfile={font}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor=white:shadowcolor=black",
 			f"tile={args.columns}x{rows}"
 		])
-		dt_frame = video.frame_rate_den / video.frame_rate_num
 		concat_inputs = "".join([ f"[{i}:v]" for i in range(cells) ])
 		ffmpeg(
 			"-vsync", "passthrough",
@@ -177,10 +185,6 @@ def process_video(video, args):
 			for f in clip_files:
 				os.unlink(f)
 			os.unlink(args.prefix + PLAYLIST_FILE)
-	if make_large:
-		for filename in glob(args.prefix + "frame*.png"):
-			if os.stat(filename).st_size > args.clip_size:
-				os.unlink(filename)
 
 def filename_pattern(pattern, n):
 	if n <= 1:
