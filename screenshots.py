@@ -61,7 +61,7 @@ DEFAULT_ARGS = Namespace(
 	gif_clips = 5,
 	gif_length = 3,
 	gif_width = 250,
-	webp_clips = 6,
+	webp_clips = 0,
 	webp_length = 5,
 	webp_width = 250,
 	montage_columns = 5,
@@ -199,9 +199,13 @@ def main(args):
 
 def process_video(video, args):
 	if args.gif_clips > 0:
+		clip_files = prepare_clips(video, args, args.gif_clips, args.gif_length, args.gif_width)
 		create_gif(video, args)
+		cleanup_clips(args, clip_files)
 	if args.webp_clips > 0:
+		clip_files = prepare_clips(video, args, args.webp_clips, args.webp_length, args.webp_width)
 		create_webp(video, args)
+		cleanup_clips(args, clip_files)
 	if args.frames > 0:
 		create_frames(video, args)
 	if args.montage_columns > 0 and args.montage_rows > 0:
@@ -210,23 +214,23 @@ def process_video(video, args):
 def digits(n):
 	return ceil(log(n + 1, 10))
 
-def create_gif(video, args):
+def prepare_clips(video, args, clips, length, width):
 	length_with_cuts = video.length - args.cut_start - args.cut_end
 	clip_files = []
 	ffinputs = []
 	ffoutputs = []
 	with open(args.prefix + PLAYLIST_FILE, "w") as playlist:
-		for i in range(args.gif_clips):
-			clip_file = f"{args.prefix}clip{i + 1:0{digits(args.gif_clips)}d}.mkv"
+		for i in range(clips):
+			clip_file = f"{args.prefix}clip{i + 1:0{digits(clips)}d}.mkv"
 			clip_files.append(clip_file)
 			if not (args.keep and os.path.exists(clip_file)):
-				ss = args.cut_start + length_with_cuts * (i + 1) / (args.gif_clips + 1) - args.gif_length / 2
-				frames = round(args.gif_length * video.frame_rate_num / video.frame_rate_den)
+				ss = args.cut_start + length_with_cuts * (i + 1) / (clips + 1) - length / 2
+				frames = round(length * video.frame_rate_num / video.frame_rate_den)
 				ffinputs.append([ "-ss", str(ss), "-i", video.filename ])
 				ffoutputs.append([
 					"-frames:v", str(frames),
 					"-pix_fmt", "yuv444p",
-					"-filter:v", f"scale={args.gif_width}:-1,setsar=1",
+					"-filter:v", f"scale={width}:-1,setsar=1",
 					"-codec:v", "libx265",
 					"-preset:v", "ultrafast",
 					"-x265-params", "lossless=1",
@@ -235,6 +239,9 @@ def create_gif(video, args):
 				])
 			playlist.write("file '{}'\n".format(clip_file))
 	ffmpeg_mimo(ffinputs, ffoutputs)
+	return clip_files
+
+def create_gif(video, args):
 	depth = args.gif_color_depth_max
 	frame_rate = min(video.frame_rate_num / video.frame_rate_den, args.gif_frame_rate_max)
 	multi_palette = True
@@ -247,10 +254,6 @@ def create_gif(video, args):
 			frame_rate = min(video.frame_rate_num / video.frame_rate_den, args.gif_frame_rate_max)
 			multi_palette = False
 		s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
-	if not args.keep:
-		for f in clip_files:
-			os.unlink(f)
-		os.unlink(args.prefix + PLAYLIST_FILE)
 
 def choose_dither_algo(depth, frame_rate, multi_palette, prefix):
 	dither_algos = {
@@ -299,9 +302,31 @@ def next_guess(depth, frame_rate, multi_palette, r):
 		# lower the framerate, the less of each frame is transparent. Hard to model, take the error into account??
 		return (depth, frame_rate * r)
 
-# TODO: WEBP support
 def create_webp(video, args):
-	pass
+	filename = args.prefix + "clips.webp"
+	size_factor = 1.05 # TODO: learn & store size factor
+	size = None
+	quality = 95
+	while size == None or args.file_size_max < size:
+		print(size, "/", args.file_size_max)
+		ffmpeg(
+			"-f", "concat",
+			"-safe", "0",
+			"-i", args.prefix + PLAYLIST_FILE,
+			"-c:v", "libwebp",
+			"-loop", "0",
+			"-compression_level", "6",
+			"-q:v", str(quality),
+			filename
+		)
+		size = os.stat(filename).st_size
+		quality -= ceil(log(size / args.file_size_max, size_factor))
+
+def cleanup_clips(args, clip_files):
+	if not args.keep:
+		for f in clip_files:
+			os.unlink(f)
+		os.unlink(args.prefix + PLAYLIST_FILE)
 
 def create_frames(video, args):
 	length_with_cuts = video.length - args.cut_start - args.cut_end
