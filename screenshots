@@ -1,0 +1,273 @@
+#!/usr/bin/python3 -O
+# vim: noexpandtab, tabstop=4, number
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from glob import glob
+import json
+from math import ceil, floor, log, sqrt
+import os
+import shlex
+from subprocess import run, DEVNULL, PIPE, CalledProcessError
+import sys
+
+PLAYLIST_FILE = "playlist.txt"
+CLIPS_FILE = "clips.gif"
+LABEL_FILE = "label.png"
+MIN_DEPTH = 96
+MAX_DEPTH = 256
+MIN_FRAME_RATE = 12
+MAX_FRAME_RATE = 50
+
+MIN_TIME_DELTA = 10
+MAX_TIME_DELTA = 60
+
+class VideoMetadata(object):
+	def __init__(self, filename):
+		self.filename = filename
+		self.text = ffprobe_text(filename)
+		metadata = ffprobe_json(filename)
+		self.metadata = metadata
+		video_streams = [ stream for stream in metadata["streams"] if stream["codec_type"] == "video" ]
+		if not video_streams:
+			raise Exception("No video stream found in " + filename)
+		default_video_streams = [ stream for stream in video_streams if stream["disposition"]["default"] == 1 ]
+		self.video_stream = default_video_streams[0] if default_video_streams else video_streams[0]
+		self.format = metadata["format"]
+
+	@property
+	def width(self): return int(self.video_stream["width"])
+	
+	@property
+	def height(self): return int(self.video_stream["height"])
+
+	@property
+	def length(self): return float(self.video_stream.get("duration", self.format.get("duration")))
+
+	@property
+	def frame_rate_str(self): return str(self.video_stream["r_frame_rate"])
+
+	@property
+	def frame_rate_num(self): return int(self.frame_rate_str.split("/")[0])
+
+	@property
+	def frame_rate_den(self): return int(self.frame_rate_str.split("/")[1])
+
+def parse_cli():
+	parser = ArgumentParser(
+		description="Take screenshots and short clips from a video",
+		formatter_class=ArgumentDefaultsHelpFormatter
+	)
+	parser.add_argument("--columns",     "-c", type=int,   default=  5,    metavar="COLS", help="Number of columns in montage")
+	parser.add_argument("--rows",        "-r", type=int,   default= 10,    metavar="ROWS", help="Number of rows in montage")
+	parser.add_argument("--width",       "-w", type=int,   default=320,    metavar="PX",   help="Width of a single screenshot in montage")
+	parser.add_argument("--frames",      "-f", type=int,   default= 20,    metavar="N",    help="Number of full size frames")
+	parser.add_argument("--clips",       "-C", type=int,   default=  5,    metavar="N",    help="Number of clips")
+	parser.add_argument("--clip-width",  "-W", type=int,   default=250,    metavar="PX",   help="Width of clips")
+	parser.add_argument("--clip-length", "-L", type=float, default=  3,    metavar="SEC",  help="Length of each clips")
+	parser.add_argument("--clip-size",   "-S", type=str,   default= "5MB", metavar="SIZE", help="Maximum total size of all clips")
+	parser.add_argument("--cut-start",   "-x", type=float, default=  0,    metavar="SEC",  help="Skip the first part of the source video")
+	parser.add_argument("--cut-end",     "-y", type=float, default=  0,    metavar="SEC",  help="Skip the last part of the source video")
+	parser.add_argument("--keep",        "-k", action="store_true",                        help="Keep and reuse temporary files")
+	parser.add_argument("--prefix",      "-p", type=str,   default="",     metavar="NAME", help="File name prefix")
+	parser.add_argument("files", nargs="+")
+	args = parser.parse_args()
+	args.clip_size = parse_size(args.clip_size)
+	return args
+
+def parse_size(s):
+	units = {
+		"KiB": 2**10, "MiB": 2**20, "GiB": 2**30, "TiB": 2**40, "PiB": 2**50, "EiB": 2**60, "ZiB": 2**70, "YiB": 2**80,
+		"kB": 10** 3, "MB": 10** 6, "GB": 10** 9, "TB": 10**12, "PB": 10**15, "EB": 10**18, "ZB": 10**21, "YB": 10**24,
+	}
+	for k, v in units.items():
+		if s.endswith(k): return float(s[:-len(k)]) * v
+	return float(s[:-1]) if s.endswith("B") else float(s)
+
+def main(args):
+	returncode = 0
+	prefix = args.prefix
+	fmt = "{}{:0" + str(digits(len(args.files))) + "}-"
+	i = 0
+	for filename in args.files:
+		try:
+			i += 1
+			if len(args.files) > 1:
+				args.prefix = fmt.format(prefix, i)
+			process_video(VideoMetadata(filename), args)
+		except CalledProcessError as ex:
+			returncode += 1
+			sys.stderr.write(ex.stderr.decode(sys.getdefaultencoding()))
+			sys.stdout.write(ex.stdout.decode(sys.getdefaultencoding()))
+	return returncode
+
+def process_video(video, args):
+	length_with_cuts = video.length - args.cut_start - args.cut_end
+	make_large = args.frames > 0
+	make_small = args.columns > 0 and args.rows > 0
+	cmd = [ "-vsync", "passthrough", "-i", video.filename ]
+	run_ffmpeg = False
+	clip_files = []
+	if args.clips > 0:
+		with open(args.prefix + PLAYLIST_FILE, "w") as playlist:
+			for i in range(1, args.clips + 1):
+				clip_file = "{}clip{:04}.mkv".format(args.prefix, i)
+				clip_files.append(clip_file)
+				if not (args.keep and os.path.exists(clip_file)):
+					ss = args.cut_start + length_with_cuts * i / (args.clips + 1) - args.clip_length / 2
+					frames = round(args.clip_length * video.frame_rate_num / video.frame_rate_den)
+					cmd += [
+						"-ss", str(ss),
+						"-frames:v", str(frames),
+						"-pix_fmt", "yuv444p",
+						"-filter:v", "scale={}:-1,setsar=1".format(args.clip_width),
+						"-codec:v", "libx265",
+						"-preset:v", "ultrafast",
+						"-x265-params", "lossless=1",
+						"-an", "-sn", "-dn",
+						clip_file
+					]
+					run_ffmpeg = True
+				playlist.write("file '{}'\n".format(clip_file))
+	if make_large:
+		frame_rate = args.frames / length_with_cuts
+		cmd += [ "-ss", str(args.cut_start), "-filter:v", "fps=" + str(frame_rate), "-frames:v", str(args.frames), filename_pattern(args.prefix + "frame{}.png", args.frames) ]
+		run_ffmpeg = True
+	if make_small:
+		rows = min(max(floor(video.length / (MIN_TIME_DELTA * args.columns)), 1), args.rows)
+		frame_rate = args.columns * rows / video.length
+		cmd += [
+			"-filter:v", "fps={},scale={}:-1,drawtext=x=4:y=4:text=%{{pts\\\:hms}}:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:fontcolor=white:shadowcolor=black:shadowx=-2:shadowy=-2,tile={}x{}".format(frame_rate, args.width, args.columns, rows),
+			"-frames:v", "1",
+			args.prefix + "montage.png"
+		]
+		run_ffmpeg = True
+	if run_ffmpeg:
+		ffmpeg(*cmd)
+	if args.clips > 0:
+		depth = MAX_DEPTH
+		frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
+		multi_palette = True
+		s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
+		while s > args.clip_size:
+			r = args.clip_size / s
+			depth, frame_rate = next_guess(depth, frame_rate, multi_palette, r)
+			if multi_palette and (depth < MIN_DEPTH or frame_rate < MIN_FRAME_RATE):
+				depth = MAX_DEPTH
+				frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
+				multi_palette = False
+			s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
+		if not args.keep:
+			for f in clip_files:
+				os.unlink(f)
+			os.unlink(args.prefix + PLAYLIST_FILE)
+	if make_large:
+		for filename in glob(args.prefix + "frame*.png"):
+			if os.stat(filename).st_size > args.clip_size:
+				os.unlink(filename)
+	if make_small:
+		create_label(args.prefix + LABEL_FILE, video.text, args.columns * args.width)
+		for filename in glob(args.prefix + "montage*.png"):
+			append_label(filename.replace(".png", ".jpg"), args.prefix + LABEL_FILE, filename)
+			os.unlink(filename)
+		os.unlink(args.prefix + LABEL_FILE)
+
+def filename_pattern(pattern, n):
+	if n <= 1:
+		return pattern.format("")
+	else:
+		return pattern.format("%0" + str(digits(n)) + "d")
+
+def digits(n):
+	return ceil(log(n + 1, 10))
+
+def choose_dither_algo(depth, frame_rate, multi_palette, prefix):
+	dither_algos = {
+		prefix + "bayer1.gif":			"dither=bayer:bayer_scale=1",
+		prefix + "bayer2.gif":			"dither=bayer:bayer_scale=2",
+		prefix + "bayer3.gif":			"dither=bayer:bayer_scale=3",
+		prefix + "bayer4.gif":			"dither=bayer:bayer_scale=4",
+		prefix + "floyd_steinberg.gif":	"dither=floyd_steinberg",
+		prefix + "sierra2.gif":			"dither=sierra2",
+		prefix + "sierra2_4a.gif":		"dither=sierra2_4a"
+	}
+	cmd = [ "-f", "concat", "-i", prefix + PLAYLIST_FILE ]
+	for name, algo in dither_algos.items():
+		cmd += [ "-filter:v", filter_v(depth, frame_rate, algo, multi_palette), name ]
+	ffmpeg(*cmd)
+	best = None
+	for name, algo in dither_algos.items():
+		current = ( name, algo, os.stat(name).st_size )
+		if not best:
+			best = current
+		elif current[2] <= best[2]:
+			os.unlink(best[0])
+			best = current
+		else:
+			os.unlink(current[0])
+	os.rename(best[0], prefix + CLIPS_FILE)
+	return best[2]
+
+def filter_v(depth, frame_rate, dither_algo, multi_palette):
+	fmt = "fps={},split[a][b],[a]fifo[c],[b]palettegen=max_colors={}:{}:{}[p],[c][p]paletteuse={}:{}"
+	stats_mode = "stats_mode=single" if multi_palette else "stats_mode=diff"
+	transparent = "reserve_transparent=0" if multi_palette else "reserve_transparent=1"
+	new = "new=1" if multi_palette else "new=0"
+	return fmt.format(frame_rate, depth, stats_mode, transparent, dither_algo, new)
+
+def next_guess(depth, frame_rate, multi_palette, r):
+	if multi_palette:
+		new_depth = depth // 2
+		new_frame_rate = log(depth, 2) * frame_rate * r / log(new_depth, 2)
+		while new_frame_rate > frame_rate:
+			new_depth = (new_depth + depth) // 2
+			new_frame_rate = log(depth, 2) * frame_rate * r / log(new_depth, 2)
+		return (new_depth, new_frame_rate)
+	else:
+		# TODO: This always underestimates the size, leading to several passes in single palette mode. It's because the
+		# lower the framerate, the less of each frame is transparent. Hard to model, take the error into account??
+		return (depth, frame_rate * r)
+
+def ffmpeg(*args):
+	print("ffmpeg", " ".join([ shlex.quote(arg) for arg in args ]))
+	proc = run(( "ffmpeg", "-y", "-hide_banner" ) + args, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
+
+def ffprobe_json(filename):
+	proc = run(
+		[ "ffprobe", "-hide_banner", "-print_format", "json", "-show_format", "-show_streams", filename ],
+		stdin=DEVNULL, stdout=PIPE, stderr=PIPE
+	)
+	proc.check_returncode()
+	return json.loads(proc.stdout.decode(sys.getdefaultencoding()))
+
+def ffprobe_text(filename):
+	proc = run(
+		[ "ffprobe", "-hide_banner", filename ],
+		stdin=DEVNULL, stdout=PIPE, stderr=PIPE
+	)
+	proc.check_returncode()
+	return proc.stderr.decode(sys.getdefaultencoding()).strip()
+
+def create_label(filename, text, width):
+	proc = run([
+		"convert",
+		"-background", "black",
+		"-fill", "white",
+		"-font", "DejaVu-Sans-Mono",
+		"-pointsize", "16",
+		"-size", str(width) + "x",
+		"caption:" + text,
+		filename
+	], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
+
+def append_label(outfile, *args):
+	proc = run([
+		"convert",
+		"-quality", "95",
+		"-background", "black",
+		"-append"
+	] + list(args) + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
+
+if __name__ == "__main__":
+	sys.exit(main(parse_cli()))
