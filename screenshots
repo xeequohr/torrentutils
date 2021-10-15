@@ -108,26 +108,45 @@ def process_video(video, args):
 	run_ffmpeg = False
 	clip_files = []
 	if args.clips > 0:
+		ffinputs = []
+		ffoutputs = []
 		with open(args.prefix + PLAYLIST_FILE, "w") as playlist:
-			for i in range(1, args.clips + 1):
-				clip_file = "{}clip{:04}.mkv".format(args.prefix, i)
+			for i in range(args.clips):
+				clip_file = f"{args.prefix}clip{i + 1:0{digits(args.clips)}d}.mkv"
 				clip_files.append(clip_file)
 				if not (args.keep and os.path.exists(clip_file)):
-					ss = args.cut_start + length_with_cuts * i / (args.clips + 1) - args.clip_length / 2
+					ss = args.cut_start + length_with_cuts * (i + 1) / (args.clips + 1) - args.clip_length / 2
 					frames = round(args.clip_length * video.frame_rate_num / video.frame_rate_den)
-					cmd += [
-						"-ss", str(ss),
+					ffinputs += [ "-ss", str(ss), "-i", video.filename ]
+					ffoutputs += [
+						"-map", f"{i}:v",
 						"-frames:v", str(frames),
 						"-pix_fmt", "yuv444p",
-						"-filter:v", "scale={}:-1,setsar=1".format(args.clip_width),
+						"-filter:v", f"scale={args.clip_width}:-1,setsar=1",
 						"-codec:v", "libx265",
 						"-preset:v", "ultrafast",
 						"-x265-params", "lossless=1",
 						"-an", "-sn", "-dn",
 						clip_file
 					]
-					run_ffmpeg = True
 				playlist.write("file '{}'\n".format(clip_file))
+		ffmpeg("-vsync", "passthrough", *ffinputs, *ffoutputs)
+		depth = MAX_DEPTH
+		frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
+		multi_palette = True
+		s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
+		while s > args.clip_size:
+			r = args.clip_size / s
+			depth, frame_rate = next_guess(depth, frame_rate, multi_palette, r)
+			if multi_palette and (depth < MIN_DEPTH or frame_rate < MIN_FRAME_RATE):
+				depth = MAX_DEPTH
+				frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
+				multi_palette = False
+			s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
+		if not args.keep:
+			for f in clip_files:
+				os.unlink(f)
+			os.unlink(args.prefix + PLAYLIST_FILE)
 	if make_large:
 		dt_large = length_with_cuts / (args.frames + 1)
 		timestamps = [ args.cut_start + (i + 1) * dt_large for i in range(args.frames) ]
@@ -166,25 +185,6 @@ def process_video(video, args):
 		append_label(f"{args.prefix}montage.jpg", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
 		os.unlink(f"{args.prefix}montage.png")
 		os.unlink(args.prefix + LABEL_FILE)
-	if run_ffmpeg:
-		ffmpeg(*cmd)
-	if args.clips > 0:
-		depth = MAX_DEPTH
-		frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
-		multi_palette = True
-		s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
-		while s > args.clip_size:
-			r = args.clip_size / s
-			depth, frame_rate = next_guess(depth, frame_rate, multi_palette, r)
-			if multi_palette and (depth < MIN_DEPTH or frame_rate < MIN_FRAME_RATE):
-				depth = MAX_DEPTH
-				frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
-				multi_palette = False
-			s = choose_dither_algo(depth, frame_rate, multi_palette, args.prefix)
-		if not args.keep:
-			for f in clip_files:
-				os.unlink(f)
-			os.unlink(args.prefix + PLAYLIST_FILE)
 
 def filename_pattern(pattern, n):
 	if n <= 1:
