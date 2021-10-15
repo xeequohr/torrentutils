@@ -102,12 +102,8 @@ def main(args):
 def process_video(video, args):
 	dt_frame = video.frame_rate_den / video.frame_rate_num
 	length_with_cuts = video.length - args.cut_start - args.cut_end
-	make_large = args.frames > 0
-	make_small = args.columns > 0 and args.rows > 0
-	cmd = [ "-vsync", "passthrough", "-i", video.filename ]
-	run_ffmpeg = False
-	clip_files = []
 	if args.clips > 0:
+		clip_files = []
 		ffinputs = []
 		ffoutputs = []
 		with open(args.prefix + PLAYLIST_FILE, "w") as playlist:
@@ -117,9 +113,8 @@ def process_video(video, args):
 				if not (args.keep and os.path.exists(clip_file)):
 					ss = args.cut_start + length_with_cuts * (i + 1) / (args.clips + 1) - args.clip_length / 2
 					frames = round(args.clip_length * video.frame_rate_num / video.frame_rate_den)
-					ffinputs += [ "-ss", str(ss), "-i", video.filename ]
-					ffoutputs += [
-						"-map", f"{i}:v",
+					ffinputs.append([ "-ss", str(ss), "-i", video.filename ])
+					ffoutputs.append([
 						"-frames:v", str(frames),
 						"-pix_fmt", "yuv444p",
 						"-filter:v", f"scale={args.clip_width}:-1,setsar=1",
@@ -128,9 +123,9 @@ def process_video(video, args):
 						"-x265-params", "lossless=1",
 						"-an", "-sn", "-dn",
 						clip_file
-					]
+					])
 				playlist.write("file '{}'\n".format(clip_file))
-		ffmpeg("-vsync", "passthrough", *ffinputs, *ffoutputs)
+		ffmpeg_mimo(ffinputs, ffoutputs)
 		depth = MAX_DEPTH
 		frame_rate = min(video.frame_rate_num / video.frame_rate_den, MAX_FRAME_RATE)
 		multi_palette = True
@@ -147,50 +142,45 @@ def process_video(video, args):
 			for f in clip_files:
 				os.unlink(f)
 			os.unlink(args.prefix + PLAYLIST_FILE)
-	if make_large:
+	if args.frames > 0:
 		dt_large = length_with_cuts / (args.frames + 1)
 		timestamps = [ args.cut_start + (i + 1) * dt_large for i in range(args.frames) ]
-		ffmpeg(
-			"-vsync", "passthrough",
-			*sum([ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ], start=[]),
-			*sum([ [ "-map", f"{i}:v", "-frames:v", "1", f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png" ] for i in range(args.frames) ], start=[])
+		ffmpeg_mimo(
+			[ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ],
+			[ [ "-frames:v", "1", f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png" ] for i in range(args.frames) ]
 		)
 		for i in range(args.frames):
 			filename = f"{args.prefix}frame{i + 1:0{digits(args.frames)}d}.png"
 			if os.stat(filename).st_size > args.clip_size:
 				os.unlink(filename)
-	if make_small:
+	if args.columns > 0 and args.rows > 0:
 		rows = min(max(floor(video.length / (MIN_TIME_DELTA * args.columns)), 1), args.rows)
 		cells = args.columns * rows
 		dt_cell = video.length / (cells + 1)
 		timestamps = [ (i + 1) * dt_cell for i in range(cells) ]
 		font = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-		filter_chain = ",".join([
-			f"concat=n={cells}",
-			f"scale={args.width}:-1",
-			f"setpts=(N+1)/TB*{dt_cell}",
-			f"drawtext=text=%{{pts\\\:hms}}:fontfile={font}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor=white:shadowcolor=black",
-			f"tile={args.columns}x{rows}"
-		])
-		concat_inputs = "".join([ f"[{i}:v]" for i in range(cells) ])
-		ffmpeg(
-			"-vsync", "passthrough",
-			*sum([ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ], start=[]),
-			"-filter_complex", f"{concat_inputs}{filter_chain}[out]",
-			"-map", "[out]",
-			"-frames:v", "1",
-			f"{args.prefix}montage.png"
+		ffmpeg_mimo(
+			[ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ],
+			[
+				[
+					"-filter:v", ",".join([
+						f"scale={args.width}:-1",
+						f"setpts=({i}+1)/TB*{dt_cell}",
+						f"drawtext=text=%{{pts\\\:hms}}:fontfile={font}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor=white:shadowcolor=black",
+					]),
+					"-frames:v", "1",
+					f"{args.prefix}montage{i:0{digits(cells)}d}.png"
+				]
+				for i in range(cells)
+			]
 		)
+		montage(f"{args.prefix}montage.png", args.columns, rows, [ f"{args.prefix}montage{i:0{digits(cells)}d}.png" for i in range(cells) ])
 		create_label(args.prefix + LABEL_FILE, video.text, args.columns * args.width)
 		append_label(f"{args.prefix}montage.jpg", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
+		for i in range(cells):
+			os.unlink(f"{args.prefix}montage{i:0{digits(cells)}d}.png")
 		os.unlink(f"{args.prefix}montage.png")
 		os.unlink(args.prefix + LABEL_FILE)
-
-def filename_pattern(pattern, n):
-	if n <= 1:
-		return pattern.format("")
-	else:
-		return pattern.format("%0" + str(digits(n)) + "d")
 
 def digits(n):
 	return ceil(log(n + 1, 10))
@@ -242,6 +232,28 @@ def next_guess(depth, frame_rate, multi_palette, r):
 		# lower the framerate, the less of each frame is transparent. Hard to model, take the error into account??
 		return (depth, frame_rate * r)
 
+def ffmpeg_mimo(inputs, outputs, limit=10):
+	assert len(inputs) == len(outputs)
+	# Process `limit` inputs at a time to limit memory usage
+	N = len(inputs) // limit
+	M = len(inputs) % limit
+	for i in range(N):
+		a = i * limit
+		b = a + limit
+		ffmpeg(
+			"-vsync", "passthrough",
+			*sum(inputs[a:b], start=[]),
+			*sum([ [ "-map", f"{j}:v" ] + out for j, out in zip(range(limit), outputs[a:b]) ], start=[])
+		)
+	if M != 0:
+		a = N * limit
+		b = a + M
+		ffmpeg(
+			"-vsync", "passthrough",
+			*sum(inputs[a:b], start=[]),
+			*sum([ [ "-map", f"{j}:v" ] + out for j, out in zip(range(limit), outputs[a:b]) ], start=[])
+		)
+
 def ffmpeg(*args):
 	print("ffmpeg", " ".join([ shlex.quote(arg) for arg in args ]))
 	proc = run(( "ffmpeg", "-y", "-hide_banner" ) + args, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
@@ -262,6 +274,10 @@ def ffprobe_text(filename):
 	)
 	proc.check_returncode()
 	return proc.stderr.decode(sys.getdefaultencoding()).strip()
+
+def montage(outfile, columns, rows, infiles):
+	proc = run([ "montage", "-geometry", "+0+0", "-tile", f"{columns}x{rows}" ] + infiles + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	proc.check_returncode()
 
 def create_label(filename, text, width):
 	proc = run([
