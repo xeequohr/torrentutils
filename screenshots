@@ -133,13 +133,31 @@ def process_video(video, args):
 		run_ffmpeg = True
 	if make_small:
 		rows = min(max(floor(video.length / (MIN_TIME_DELTA * args.columns)), 1), args.rows)
-		frame_rate = args.columns * rows / video.length
-		cmd += [
-			"-filter:v", "fps={},scale={}:-1,drawtext=x=4:y=4:text=%{{pts\\\:hms}}:fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf:fontcolor=white:shadowcolor=black:shadowx=-2:shadowy=-2,tile={}x{}".format(frame_rate, args.width, args.columns, rows),
+		cells = args.columns * rows
+		dt_cell = video.length / (cells + 1)
+		timestamps = [ (i + 1) * dt_cell for i in range(cells) ]
+		font = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+		filter_chain = ",".join([
+			f"concat=n={cells}",
+			f"scale={args.width}:-1",
+			f"setpts=(N+1)/TB*{dt_cell}",
+			f"drawtext=text=%{{pts\\\:hms}}:fontfile={font}:x=4:y=4:shadowx=-2:shadowy=-2:fontcolor=white:shadowcolor=black",
+			f"tile={args.columns}x{rows}"
+		])
+		dt_frame = video.frame_rate_den / video.frame_rate_num
+		concat_inputs = "".join([ f"[{i}:v]" for i in range(cells) ])
+		ffmpeg(
+			"-vsync", "passthrough",
+			*sum([ [ "-ss", str(t), "-to", str(t + dt_frame), "-i", video.filename ] for t in timestamps ], start=[]),
+			"-filter_complex", f"{concat_inputs}{filter_chain}[out]",
+			"-map", "[out]",
 			"-frames:v", "1",
-			args.prefix + "montage.png"
-		]
-		run_ffmpeg = True
+			f"{args.prefix}montage.png"
+		)
+		create_label(args.prefix + LABEL_FILE, video.text, args.columns * args.width)
+		append_label(f"{args.prefix}montage.jpg", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
+		os.unlink(f"{args.prefix}montage.png")
+		os.unlink(args.prefix + LABEL_FILE)
 	if run_ffmpeg:
 		ffmpeg(*cmd)
 	if args.clips > 0:
@@ -163,12 +181,6 @@ def process_video(video, args):
 		for filename in glob(args.prefix + "frame*.png"):
 			if os.stat(filename).st_size > args.clip_size:
 				os.unlink(filename)
-	if make_small:
-		create_label(args.prefix + LABEL_FILE, video.text, args.columns * args.width)
-		for filename in glob(args.prefix + "montage*.png"):
-			append_label(filename.replace(".png", ".jpg"), args.prefix + LABEL_FILE, filename)
-			os.unlink(filename)
-		os.unlink(args.prefix + LABEL_FILE)
 
 def filename_pattern(pattern, n):
 	if n <= 1:
