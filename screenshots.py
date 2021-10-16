@@ -3,11 +3,12 @@
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, Namespace
 from configparser import ConfigParser
 from glob import glob
+from hashlib import sha3_224
 import json
 from math import ceil, floor, log, sqrt
 import os
 import shlex
-from subprocess import run, DEVNULL, PIPE, CalledProcessError
+from subprocess import run, Popen, DEVNULL, PIPE, CalledProcessError
 import sys
 
 class VideoMetadata(object):
@@ -61,7 +62,7 @@ DEFAULT_ARGS = Namespace(
 	gif_clips = 5,
 	gif_length = 3,
 	gif_width = 250,
-	webp_clips = 0,
+	webp_clips = 6,
 	webp_length = 5,
 	webp_width = 250,
 	montage_columns = 5,
@@ -307,8 +308,8 @@ def create_webp(video, args):
 	size_factor = 1.05 # TODO: learn & store size factor
 	size = None
 	quality = 95
+	print(unique_id(args.prefix))
 	while size == None or args.file_size_max < size:
-		print(size, "/", args.file_size_max)
 		ffmpeg(
 			"-f", "concat",
 			"-safe", "0",
@@ -321,6 +322,28 @@ def create_webp(video, args):
 		)
 		size = os.stat(filename).st_size
 		quality -= ceil(log(size / args.file_size_max, size_factor))
+
+def unique_id(prefix):
+	process = ffmpeg_popen(
+		"-f", "concat",
+		"-safe", "0",
+		"-i", prefix + PLAYLIST_FILE,
+		"-codec:v", "yuv4",
+		"-f", "rawvideo",
+		"-"
+	)
+	hash_state = sha3_224()
+	block_size = 2**13 // hash_state.block_size * hash_state.block_size
+	while True:
+		data = process.stdout.read(block_size)
+		if len(data) == 0:
+			break
+		hash_state.update(data)
+	returncode = process.wait()
+	if returncode != 0:
+		raise CalledProcessError(returncode, process.args)
+	return hash_state.hexdigest()
+	
 
 def cleanup_clips(args, clip_files):
 	if not args.keep:
@@ -364,14 +387,16 @@ def create_montage(video, args):
 	montage(f"{args.prefix}montage.png", args.montage_columns, rows, [ f"{args.prefix}montage{i:0{digits(cells)}d}.png" for i in range(cells) ])
 	create_label(video, args)
 	append_label(f"{args.prefix}montage.jpg", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
+	append_label(f"{args.prefix}montage.webp", args.prefix + LABEL_FILE, f"{args.prefix}montage.png")
+	if os.stat(f"{args.prefix}montage.jpg").st_size <= os.stat(f"{args.prefix}montage.webp").st_size:
+		os.unlink(f"{args.prefix}montage.webp")
 	for i in range(cells):
 		os.unlink(f"{args.prefix}montage{i:0{digits(cells)}d}.png")
 	os.unlink(f"{args.prefix}montage.png")
 	os.unlink(args.prefix + LABEL_FILE)
 
 def montage(outfile, columns, rows, infiles):
-	proc = run([ "montage", "-geometry", "+0+0", "-tile", f"{columns}x{rows}" ] + infiles + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
-	proc.check_returncode()
+	echo_and_run([ "montage", "-geometry", "+0+0", "-tile", f"{columns}x{rows}" ] + infiles + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
 
 def create_label(video, args):
 	proc = run([
@@ -387,13 +412,12 @@ def create_label(video, args):
 	proc.check_returncode()
 
 def append_label(outfile, *args):
-	proc = run([
+	echo_and_run([
 		"convert",
 		"-quality", "95",
 		"-background", "black",
 		"-append"
 	] + list(args) + [ outfile ], stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
-	proc.check_returncode()
 
 def ffmpeg_mimo(inputs, outputs, limit=10):
 	assert len(inputs) == len(outputs)
@@ -421,9 +445,15 @@ def flatten(list_of_lists):
 	return [val for sublist in list_of_lists for val in sublist]
 
 def ffmpeg(*args):
-	print("ffmpeg", " ".join([ shlex.quote(arg) for arg in args ]))
-	proc = run(( "ffmpeg", "-y", "-hide_banner" ) + args, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+	echo_and_run(( "ffmpeg", "-y", "-hide_banner" ) + args, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
+
+def echo_and_run(args, **kwargs):
+	print(" ".join([ shlex.quote(arg) for arg in args ]))
+	proc = run(args, stdin=DEVNULL, stdout=PIPE, stderr=PIPE)
 	proc.check_returncode()
+
+def ffmpeg_popen(*args):
+	return Popen(( "ffmpeg", "-y", "-hide_banner" ) + args, stdin=DEVNULL, stdout=PIPE, stderr=DEVNULL)
 
 def ffprobe_json(filename):
 	proc = run(
